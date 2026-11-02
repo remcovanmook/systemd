@@ -16,6 +16,7 @@
 #include "ndisc-router-internal.h"
 #include "networkd-address.h"
 #include "networkd-address-generation.h"
+#include "networkd-dhcp4.h"
 #include "networkd-dhcp6.h"
 #include "networkd-ipv6ll.h"
 #include "networkd-link.h"
@@ -2577,9 +2578,17 @@ static int ndisc_drop_outdated(Link *link, const struct in6_addr *router, usec_t
          * valid lifetimes to improve the reaction of SLAAC to renumbering events.
          * See draft-ietf-6man-slaac-renum-02, section 4.2. */
 
+        size_t n_routers = hashmap_size(link->ndisc_routers_by_sender);
+
         r = ndisc_drop_routers(link, router, timestamp_usec);
         if (r < 0)
                 RET_GATHER(ret, log_link_warning_errno(link, r, "Failed to drop outdated default router, ignoring: %m"));
+
+        if (hashmap_size(link->ndisc_routers_by_sender) != n_routers) {
+                r = dhcp4_ipv6_resolved_gateway_update(link);
+                if (r < 0)
+                        RET_GATHER(ret, log_link_warning_errno(link, r, "Failed to update IPv6-resolved IPv4 gateway, ignoring: %m"));
+        }
 
         SET_FOREACH(route, link->manager->routes) {
                 if (route->source != NETWORK_CONFIG_SOURCE_NDISC)
@@ -2692,6 +2701,7 @@ static int ndisc_expire_handler(sd_event_source *s, uint64_t usec, void *userdat
 
         (void) ndisc_drop_outdated(link, /* router= */ NULL, now_usec);
         (void) ndisc_setup_expire(link);
+
         return 0;
 }
 
@@ -2900,6 +2910,13 @@ static int ndisc_router_handler(Link *link, sd_ndisc_router *rt) {
         if (!link->ndisc_configured)
                 link_set_state(link, LINK_STATE_CONFIGURING);
 
+        /* The default router list may have changed: a newly learned router may
+         * satisfy a deferred IPv6-resolved IPv4 default gateway, and an RA with
+         * zero lifetime may have removed the one in use. */
+        r = dhcp4_ipv6_resolved_gateway_update(link);
+        if (r < 0)
+                return r;
+
         link_check_ready(link);
         return 0;
 }
@@ -2925,8 +2942,10 @@ static int ndisc_neighbor_handle_non_router_message(Link *link, sd_ndisc_neighbo
 
         /* Also remove the default gateway via the host, but keep the configurations based on the RA options. */
         _cleanup_(sd_ndisc_router_unrefp) sd_ndisc_router *rt = hashmap_remove(link->ndisc_routers_by_sender, &address);
-        if (rt)
+        if (rt) {
                 RET_GATHER(r, ndisc_router_drop_default(link, rt));
+                RET_GATHER(r, dhcp4_ipv6_resolved_gateway_update(link));
+        }
 
         return r;
 }
@@ -2958,6 +2977,10 @@ static int ndisc_neighbor_handle_router_message(Link *link, sd_ndisc_neighbor *n
                 return 0; /* the router address is not changed */
 
         r = ndisc_update_router_address(link, &original_address, &current_address);
+        if (r < 0)
+                return r;
+
+        r = dhcp4_ipv6_resolved_gateway_update(link);
         if (r < 0)
                 return r;
 

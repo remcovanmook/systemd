@@ -21,6 +21,7 @@ static inline int dhcp4_start(Link *link) {
 int dhcp4_renew(Link *link);
 int dhcp4_lease_lost(Link *link);
 int dhcp4_check_ready(Link *link);
+int dhcp4_ipv6_resolved_gateway_update(Link *link);
 
 int link_request_dhcp4_client(Link *link);
 int link_drop_dhcp4_config(Link *link, Network *network);

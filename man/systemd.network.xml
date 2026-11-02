@@ -2938,6 +2938,46 @@ MultiPathRoute=2001:db8::1@eth0</programlisting>
       </varlistentry>
 
       <varlistentry>
+        <term><varname>UseIPv6ResolvedGateway=</varname></term>
+        <listitem>
+          <para>Takes a boolean. When true, and the DHCP server provides the special-purpose router
+          address configured with <varname>IPv6ResolvedGatewayAddress=</varname> (see
+          <ulink url="https://datatracker.ietf.org/doc/draft-ietf-intarea-ipv6-resolved-gateway/">draft-ietf-intarea-ipv6-resolved-gateway</ulink>),
+          the IPv4 default route is configured with an IPv6 next hop: the IPv6 default router with the
+          highest preference (RFC 4191) learned via Router Advertisements on the same interface. When
+          several default routers share that highest preference, the IPv4 default is installed as an
+          equal-cost multipath route across all of them, mirroring the IPv6 default. The next-hop
+          link-layer address is resolved through IPv6 Neighbor Discovery instead of ARP, enabling
+          native IPv4 connectivity on IPv6-only network segments. The route is re-evaluated
+          whenever the default router list changes, and removed when no default router remains. Routes
+          that would use the router, such as those configured by <varname>RoutesToDNS=</varname>,
+          <varname>RoutesToNTP=</varname> and <varname>Gateway=_dhcp4</varname>, get the same next hops.
+          Routers are not used if <varname>UseGateway=</varname> in the [IPv6AcceptRA] section is disabled,
+          in which case no such routes are configured. Only takes
+          effect when <varname>UseGateway=</varname> in this section is
+          enabled, and is subject to the same RFC 3442 precedence rule. The route uses the standard DHCPv4
+          route metric (see <varname>RouteMetric=</varname>) and does not follow the metric of the
+          selected IPv6 default route. Defaults to false.</para>
+
+          <para>This implements a draft specification that may still evolve; the option is provided on
+          an experimental basis and its semantics may change in future versions.</para>
+
+          <xi:include href="version-info.xml" xpointer="v263"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>IPv6ResolvedGatewayAddress=</varname></term>
+        <listitem>
+          <para>Takes an IPv4 address. The router address that <varname>UseIPv6ResolvedGateway=</varname>
+          acts on. Defaults to 192.0.0.11, the address suggested by the draft, which is provisional until
+          IANA assigns one. An empty string resets the setting to the default.</para>
+
+          <xi:include href="version-info.xml" xpointer="v263"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>UseTimezone=</varname></term>
         <listitem><para>When true, the timezone received from the DHCP server will be set as timezone
         of the local system. Defaults to false.</para>

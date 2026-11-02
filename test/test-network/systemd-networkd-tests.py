@@ -9880,6 +9880,195 @@ class NetworkdDHCPClientTests(unittest.TestCase, Utilities):
 
         check_json(networkctl_json())
 
+    def test_dhcp_client_ipv6_resolved_gateway(self):
+        # draft-ietf-intarea-ipv6-resolved-gateway: the DHCPv4 Router option
+        # 192.0.0.11 means the IPv4 default route uses the RA-learned IPv6
+        # default router as next hop (RTA_VIA), resolved via ND, not ARP.
+        copy_network_unit('25-veth.netdev',
+                          '25-dhcp-server-ipv6-resolved-gw.network',
+                          '25-dhcp-client-ipv6-resolved-gw.network')
+        start_networkd()
+        self.wait_online('veth99:routable', 'veth-peer:routable')
+
+        # The default route may be installed only once an RA has been
+        # received (deferred install), slightly after the link is online.
+        self.wait_route('veth99', r'default via inet6 fe80:[0-9a-f:]+ proto dhcp', ipv='-4')
+        output = check_output('ip -4 route show dev veth99 default')
+        print(output)
+        self.assertRegex(output, r'default via inet6 fe80:[0-9a-f:]+ proto dhcp')
+
+        # Routes to servers and with Gateway=_dhcp4 follow the same next hop. Nothing may
+        # use the IPv4 gateway, and the host must never have tried to resolve it with ARP.
+        self.wait_route('veth99', r'192\.0\.2\.53 via inet6 fe80:[0-9a-f:]+ proto dhcp', ipv='-4')
+        self.wait_route('veth99', r'192\.0\.2\.123 via inet6 fe80:[0-9a-f:]+ proto dhcp', ipv='-4')
+        self.wait_route('veth99', r'203\.0\.113\.0/24 via inet6 fe80:[0-9a-f:]+ proto dhcp', ipv='-4')
+        output = check_output('ip -4 route show dev veth99')
+        print(output)
+        self.assertNotIn('192.0.0.11', output)
+        output = check_output('ip -4 neigh show dev veth99')
+        print(output)
+        self.assertNotIn('192.0.0.11', output)
+
+        # Re-evaluation: the route must survive an RA refresh.
+        networkctl('reconfigure', 'veth-peer')
+        self.wait_online('veth99:routable', 'veth-peer:routable')
+        self.wait_route('veth99', r'default via inet6 fe80:[0-9a-f:]+ proto dhcp', ipv='-4')
+        output = check_output('ip -4 route show dev veth99 default')
+        self.assertRegex(output, r'default via inet6 fe80:[0-9a-f:]+ proto dhcp')
+
+        # The route must go away with the last IPv6 default router.
+        with open(
+            os.path.join(network_unit_dir, '25-dhcp-server-ipv6-resolved-gw.network'),
+            mode='a',
+            encoding='utf-8',
+        ) as f:
+            f.write('''
+[IPv6SendRA]
+RouterLifetimeSec=0
+''')
+        networkctl_reload()
+        self.wait_route_dropped('veth99', r'via inet6', ipv='-4')
+
+    def test_dhcp_client_ipv6_resolved_gateway_ndisc_no_gateway(self):
+        copy_network_unit('25-veth.netdev',
+                          '25-dhcp-server-ipv6-resolved-gw.network',
+                          '25-dhcp-client-ipv6-resolved-gw.network')
+        with open(
+            os.path.join(network_unit_dir, '25-dhcp-client-ipv6-resolved-gw.network'),
+            mode='a',
+            encoding='utf-8',
+        ) as f:
+            f.write('''
+[IPv6AcceptRA]
+UseGateway=no
+''')
+        start_networkd()
+        self.wait_online('veth99:routable', 'veth-peer:routable')
+        self.wait_route('veth99', r'192\.168\.5\.0/24 proto kernel', ipv='-4')
+
+        # Give the RA time to arrive: the router must not be used, for IPv4 as for IPv6.
+        time.sleep(5)
+        output = check_output('ip -4 route show dev veth99')
+        print(output)
+        self.assertNotIn('via inet6', output)
+        self.assertNotIn('192.0.0.11', output)
+
+    def test_dhcp_client_ipv6_resolved_gateway_address(self):
+        copy_network_unit('25-veth.netdev',
+                          '25-dhcp-server-ipv6-resolved-gw.network',
+                          '25-dhcp-client-ipv6-resolved-gw.network')
+        with open(
+            os.path.join(network_unit_dir, '25-dhcp-client-ipv6-resolved-gw.network'),
+            mode='a',
+            encoding='utf-8',
+        ) as f:
+            f.write('''
+[DHCPv4]
+IPv6ResolvedGatewayAddress=192.0.0.99
+''')
+        start_networkd()
+        self.wait_online('veth99:routable', 'veth-peer:routable')
+
+        # The server still hands out 192.0.0.11, which is an ordinary router now.
+        self.wait_route('veth99', r'default via 192\.0\.0\.11 proto dhcp', ipv='-4')
+
+        with open(
+            os.path.join(network_unit_dir, '25-dhcp-server-ipv6-resolved-gw.network'),
+            mode='a',
+            encoding='utf-8',
+        ) as f:
+            f.write('''
+[DHCPServer]
+Router=192.0.0.99
+''')
+        networkctl_reload()
+        networkctl_reconfigure('veth99')
+        self.wait_online('veth99:routable', 'veth-peer:routable')
+        self.wait_route('veth99', r'default via inet6 fe80:[0-9a-f:]+ proto dhcp', ipv='-4')
+        output = check_output('ip -4 route show dev veth99 default')
+        print(output)
+        self.assertNotIn('via 192.0.0', output)
+
+    def test_dhcp_client_ipv6_resolved_gateway_multipath(self):
+        copy_network_unit(
+            '25-veth-client.netdev',
+            '25-veth-router-high.netdev',
+            '25-veth-router-low.netdev',
+            '26-bridge.netdev',
+            '25-veth-bridge.network',
+            '25-veth-client.network',
+            '25-veth-router-high.network',
+            '25-veth-router-low.network',
+            '25-bridge99.network',
+        )
+        with open(os.path.join(network_unit_dir, '25-veth-client.network'), mode='a', encoding='utf-8') as f:
+            f.write('''
+[Network]
+DHCP=ipv4
+[DHCPv4]
+UseIPv6ResolvedGateway=yes
+''')
+        with open(
+            os.path.join(network_unit_dir, '25-veth-router-high.network'), mode='a', encoding='utf-8'
+        ) as f:
+            f.write('''
+[Network]
+DHCPServer=yes
+[IPv6SendRA]
+RouterPreference=medium
+[DHCPServer]
+ServerAddress=192.168.5.1/24
+PoolOffset=10
+PoolSize=50
+Router=192.0.0.11
+''')
+        with open(
+            os.path.join(network_unit_dir, '25-veth-router-low.network'), mode='a', encoding='utf-8'
+        ) as f:
+            f.write('''
+[IPv6SendRA]
+RouterPreference=medium
+''')
+        start_networkd()
+        self.wait_online(
+            'client-p:enslaved',
+            'router-high:routable',
+            'router-high-p:enslaved',
+            'router-low:degraded',
+            'router-low-p:enslaved',
+            'bridge99:routable',
+        )
+        networkctl_reconfigure('client')
+        self.wait_online('client:routable')
+
+        # Multipath routes carry no RTA_OIF, hence do not filter by device here.
+        multipath = (
+            r'default proto dhcp [^\n]*\n'
+            r'\s+nexthop via inet6 fe80:[0-9a-f:]+ dev client [^\n]*\n'
+            r'\s+nexthop via inet6 fe80:[0-9a-f:]+ dev client '
+        )
+        for _ in range(100):
+            output = check_output('ip -4 route show default')
+            if re.search(multipath, output):
+                break
+            time.sleep(0.5)
+        print(output)
+        self.assertRegex(output, multipath)
+
+        # A better preference supersedes the set, leaving a single next hop.
+        with open(
+            os.path.join(network_unit_dir, '25-veth-router-low.network'), mode='a', encoding='utf-8'
+        ) as f:
+            f.write('''
+[IPv6SendRA]
+RouterPreference=high
+''')
+        networkctl_reload()
+        self.wait_route('client', r'default via inet6 fe80:[0-9a-f:]+ proto dhcp', ipv='-4')
+        output = check_output('ip -4 route show default')
+        print(output)
+        self.assertNotIn('nexthop', output)
+
     def test_dhcp_client_settings_anonymize(self):
         copy_network_unit(
             '25-veth.netdev',

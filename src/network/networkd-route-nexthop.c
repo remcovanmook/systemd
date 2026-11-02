@@ -1038,6 +1038,38 @@ int config_parse_route_nexthop(
         return 1;
 }
 
+int route_nexthops_add_ipv6_via(Route *route, const struct in6_addr *gws, size_t n, int ifindex) {
+        assert(route);
+        assert(gws || n == 0);
+
+        /* Build an equal-cost multipath set of IPv6-via next hops (RTA_VIA on an
+         * IPv4 route): one RouteNextHop per gateway, all on the same interface.
+         * Used for the IPv6-resolved IPv4 gateway when several IPv6
+         * default routers share the highest RFC 4191 preference, so the IPv4
+         * default is spread across them exactly as the IPv6 default is. */
+
+        FOREACH_ARRAY(gw, gws, n) {
+                _cleanup_(route_nexthop_freep) RouteNextHop *nh = NULL;
+                int r;
+
+                nh = new0(RouteNextHop, 1);
+                if (!nh)
+                        return -ENOMEM;
+
+                nh->family = AF_INET6;
+                nh->gw.in6 = *gw;
+                nh->ifindex = ifindex;
+
+                r = ordered_set_ensure_put(&route->nexthops, &route_nexthop_hash_ops, nh);
+                if (r < 0)
+                        return r;
+
+                TAKE_PTR(nh);
+        }
+
+        return 0;
+}
+
 int config_parse_multipath_route(
                 const char *unit,
                 const char *filename,

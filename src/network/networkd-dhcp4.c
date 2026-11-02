@@ -9,6 +9,7 @@
 
 #include "sd-dhcp-protocol.h"
 #include "sd-ipv4ll.h"
+#include "sd-ndisc.h"
 
 #include "alloc-util.h"
 #include "conf-parser.h"
@@ -31,9 +32,11 @@
 #include "networkd-setlink.h"
 #include "networkd-state-file.h"
 #include "networkd-wwan.h"
+#include "ordered-set.h"
 #include "parse-util.h"
 #include "set.h"
 #include "socket-util.h"
+#include "sort-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
@@ -119,6 +122,84 @@ static int dhcp4_get_router(Link *link, struct in_addr *ret) {
         return -ENODATA;
 }
 
+/* draft-ietf-intarea-ipv6-resolved-gateway: a special-purpose IPv4 gateway address signals that the
+ * link-layer address of the IPv4 default gateway is resolved from the IPv6 default router list and neighbor
+ * cache (RFC 4861, RFC 4191), never via ARP. The draft suggests 192.0.0.11, but IANA has not assigned an address yet,
+ * hence the default can be overridden with IPv6ResolvedGatewayAddress=. */
+#define DHCP4_GATEWAY_IPV6_RESOLVED_DEFAULT htobe32(UINT32_C(0xc000000b))
+
+static int ndisc_preference_rank(uint8_t pref) {
+        switch (pref) {
+        case SD_NDISC_PREFERENCE_HIGH:
+                return 2;
+        case SD_NDISC_PREFERENCE_MEDIUM:
+                return 1;
+        case SD_NDISC_PREFERENCE_LOW:
+                return 0;
+        default:
+                return -1; /* reserved value: ignore the router */
+        }
+}
+
+static int dhcp4_select_ndisc_routers(Link *link, struct in6_addr **ret, size_t *ret_n) {
+        _cleanup_free_ struct in6_addr *gws = NULL;
+        struct in6_addr *sender;
+        sd_ndisc_router *rt;
+        int best_rank = -1;
+        size_t n = 0;
+
+        assert(link);
+        assert(link->network);
+        assert(ret);
+        assert(ret_n);
+
+        /* [IPv6AcceptRA] UseGateway=no: routers learned from RAs are not to be used as gateways. */
+        if (!link->network->ndisc_use_gateway)
+                return -ENODATA;
+
+        /* RFC 4191 router selection: the highest Default Router Preference
+         * wins. Every default router sharing that preference is returned, so
+         * the IPv4 default is installed across them as equal-cost multipath --
+         * mirroring the IPv6 default, which the kernel merges the same way.
+         * Entries with expired lifetimes are removed from
+         * ndisc_routers_by_sender by the NDisc machinery before we are called. */
+
+        HASHMAP_FOREACH_KEY(rt, sender, link->ndisc_routers_by_sender) {
+                uint8_t pref;
+                int rank;
+
+                if (sd_ndisc_router_get_preference(rt, &pref) < 0)
+                        pref = SD_NDISC_PREFERENCE_MEDIUM;
+
+                rank = ndisc_preference_rank(pref);
+                if (rank < 0)
+                        continue; /* reserved preference value: ignore */
+
+                if (rank > best_rank) {
+                        /* A strictly better preference supersedes the set. */
+                        best_rank = rank;
+                        n = 0;
+                } else if (rank < best_rank)
+                        continue;
+
+                if (!GREEDY_REALLOC(gws, n + 1))
+                        return -ENOMEM;
+                gws[n++] = *sender;
+        }
+
+        if (n == 0)
+                return -ENODATA;
+
+        /* Deterministic order (numerically lowest address first) so the
+         * next-hop set, and thus the installed route's identity, is stable
+         * across reconciles regardless of hashmap iteration order. */
+        typesafe_qsort(gws, n, in6_addr_compare_func);
+
+        *ret = TAKE_PTR(gws);
+        *ret_n = n;
+        return 0;
+}
+
 static int dhcp4_get_classless_static_or_static_routes(Link *link, sd_dhcp_route ***ret_routes, size_t *ret_num) {
         _cleanup_free_ sd_dhcp_route **routes = NULL;
         int r;
@@ -150,6 +231,27 @@ static int dhcp4_get_classless_static_or_static_routes(Link *link, sd_dhcp_route
         if (ret_num)
                 *ret_num = r;
         return 0; /* static */
+}
+
+static bool dhcp4_router_is_ipv6_resolved(Link *link, const struct in_addr *router) {
+        assert(link);
+        assert(link->network);
+        assert(link->dhcp_lease);
+        assert(router);
+
+        if (!link->network->dhcp_use_gateway || !link->network->dhcp_use_ipv6_resolved_gateway)
+                return false;
+
+        /* According to RFC 3442: If the DHCP server returns both a Classless Static Routes option and
+         * a Router option, the DHCP client MUST ignore the Router option. */
+        if (link->network->dhcp_use_routes &&
+            dhcp4_get_classless_static_or_static_routes(link, /* ret_routes= */ NULL, /* ret_num= */ NULL) > 0)
+                return false;
+
+        if (in4_addr_is_set(&link->network->dhcp_ipv6_resolved_gateway_address))
+                return router->s_addr == link->network->dhcp_ipv6_resolved_gateway_address.s_addr;
+
+        return router->s_addr == DHCP4_GATEWAY_IPV6_RESOLVED_DEFAULT;
 }
 
 static int dhcp4_find_gateway_for_destination(
@@ -609,6 +711,165 @@ static int dhcp4_request_classless_static_or_static_routes(Link *link) {
         return 0;
 }
 
+static bool ipv6_resolved_route_on_link(const Route *route, const Link *link) {
+        RouteNextHop *nh;
+
+        /* An IPv4 route whose every next hop is an IPv6 via on this link -- the
+         * shape dhcp4_route_set_ipv6_resolved_nexthops() produces, single-hop
+         * (route->nexthop) or multipath (route->nexthops), for the default route
+         * as well as for routes to servers and with Gateway=_dhcp4. */
+
+        if (route->family != AF_INET)
+                return false;
+
+        if (ordered_set_isempty(route->nexthops))
+                return route->nexthop.family == AF_INET6 &&
+                       route->nexthop.ifindex == link->ifindex;
+
+        ORDERED_SET_FOREACH(nh, route->nexthops)
+                if (nh->family != AF_INET6 || nh->ifindex != link->ifindex)
+                        return false;
+        return true;
+}
+
+static bool ipv6_resolved_route_matches(const Route *route, const struct in6_addr *gws, size_t n_gws) {
+        RouteNextHop *nh;
+
+        /* Whether an IPv6-resolved IPv4 default route (see
+         * ipv6_resolved_route_on_link) already carries exactly the selected
+         * next-hop set -- so it can be left in place rather than churned. Both
+         * sets are duplicate-free, so equal size plus containment means equal. */
+
+        if (ordered_set_isempty(route->nexthops))
+                return n_gws == 1 && in6_addr_equal(&route->nexthop.gw.in6, &gws[0]);
+
+        if (ordered_set_size(route->nexthops) != n_gws)
+                return false;
+
+        ORDERED_SET_FOREACH(nh, route->nexthops) {
+                bool found = false;
+
+                FOREACH_ARRAY(gw, gws, n_gws)
+                        if (in6_addr_equal(&nh->gw.in6, gw)) {
+                                found = true;
+                                break;
+                        }
+                if (!found)
+                        return false;
+        }
+        return true;
+}
+
+static int dhcp4_route_set_ipv6_resolved_nexthops(Route *route, Link *link) {
+        _cleanup_free_ struct in6_addr *gws = NULL;
+        size_t n_gws = 0;
+        int r;
+
+        assert(route);
+        assert(link);
+
+        /* No ARP, and no route-to-gateway host route: each next hop is a selected IPv6 default router, whose
+         * link-layer address the kernel resolves via Neighbor Discovery (RTA_VIA). One router makes a
+         * single-hop route, several an equal-cost multipath route, so IPv4 forwards exactly as the IPv6
+         * default does. Returns 0 if no router is known, in which case the route must not be requested. */
+
+        r = dhcp4_select_ndisc_routers(link, &gws, &n_gws);
+        if (r == -ENODATA)
+                return 0;
+        if (r < 0)
+                return r;
+
+        if (n_gws == 1) {
+                route->nexthop.family = AF_INET6;
+                route->nexthop.gw.in6 = gws[0];
+                return 1;
+        }
+
+        route->nexthop.family = AF_UNSPEC;
+        route->nexthop.gw = IN_ADDR_NULL;
+
+        r = route_nexthops_add_ipv6_via(route, gws, n_gws, link->ifindex);
+        if (r < 0)
+                return r;
+
+        return 1;
+}
+
+static int dhcp4_drop_stale_ipv6_resolved_routes(Link *link) {
+        _cleanup_free_ struct in6_addr *gws = NULL;
+        _cleanup_free_ Route **stale = NULL;
+        size_t n_gws = 0, n_stale = 0;
+        Route *existing;
+        int r;
+
+        assert(link);
+        assert(link->manager);
+
+        r = dhcp4_select_ndisc_routers(link, &gws, &n_gws);
+        if (r < 0 && r != -ENODATA)
+                return r;
+
+        /* Drop previously configured IPv6-resolved routes on this link whose next-hop set differs from the
+         * one selected now (a router appeared, vanished, or changed preference). If no router is left, the
+         * selected set is empty and every such route goes. A route that already matches is left in place,
+         * as requesting it again is idempotent. Collect first, remove after, to avoid modifying the set
+         * while iterating. */
+
+        SET_FOREACH(existing, link->manager->routes) {
+                if (existing->source != NETWORK_CONFIG_SOURCE_DHCP4)
+                        continue;
+                if (!ipv6_resolved_route_on_link(existing, link))
+                        continue;
+                if (ipv6_resolved_route_matches(existing, gws, n_gws))
+                        continue;
+
+                if (!GREEDY_REALLOC(stale, n_stale + 1))
+                        return -ENOMEM;
+
+                stale[n_stale++] = existing;
+        }
+
+        FOREACH_ARRAY(rt, stale, n_stale)
+                (void) route_remove_and_cancel(*rt, link->manager);
+
+        return 0;
+}
+
+static int dhcp4_request_ipv6_resolved_gateway(Link *link) {
+        _cleanup_(route_unrefp) Route *route = NULL;
+        int r;
+
+        assert(link);
+        assert(link->dhcp_lease);
+
+        r = dhcp4_drop_stale_ipv6_resolved_routes(link);
+        if (r < 0)
+                return r;
+
+        r = route_new(&route);
+        if (r < 0)
+                return r;
+
+        r = dhcp4_route_set_ipv6_resolved_nexthops(route, link);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                /* Once an RA is received, ndisc_router_handler() invokes
+                 * dhcp4_ipv6_resolved_gateway_update() and we get here again. */
+                log_link_debug(link, "DHCP: router is the IPv6-resolved gateway, "
+                               "but no usable IPv6 default router is known, deferring.");
+                return 0;
+        }
+
+        r = sd_dhcp_lease_get_address(link->dhcp_lease, &route->prefsrc.in);
+        if (r < 0)
+                return r;
+
+        log_link_debug(link, "DHCP: router is the IPv6-resolved gateway, using IPv6 default router(s) as IPv4 next hop(s).");
+
+        return dhcp4_request_route(route, link);
+}
+
 static int dhcp4_request_default_gateway(Link *link) {
         _cleanup_(route_unrefp) Route *route = NULL;
         struct in_addr address, router;
@@ -637,6 +898,9 @@ static int dhcp4_request_default_gateway(Link *link) {
         }
         if (r < 0)
                 return r;
+
+        if (dhcp4_router_is_ipv6_resolved(link, &router))
+                return dhcp4_request_ipv6_resolved_gateway(link);
 
         r = route_new(&route);
         if (r < 0)
@@ -701,6 +965,20 @@ static int dhcp4_request_semi_static_routes(Link *link) {
                                 return r;
                 }
 
+                if (dhcp4_router_is_ipv6_resolved(link, &gw)) {
+                        r = dhcp4_route_set_ipv6_resolved_nexthops(route, link);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                continue; /* Deferred until a router is known. */
+
+                        r = dhcp4_request_route(route, link);
+                        if (r < 0)
+                                return r;
+
+                        continue;
+                }
+
                 r = dhcp4_request_prefix_route(link, route);
                 if (r < 0)
                         return r;
@@ -752,6 +1030,24 @@ static int dhcp4_request_routes_to_servers(
                 route->dst.in = *dst;
                 route->dst_prefixlen = 32;
 
+                if (dhcp4_router_is_ipv6_resolved(link, &gw)) {
+                        r = dhcp4_route_set_ipv6_resolved_nexthops(route, link);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                continue; /* Deferred until a router is known. */
+
+                        r = sd_dhcp_lease_get_address(link->dhcp_lease, &route->prefsrc.in);
+                        if (r < 0)
+                                return r;
+
+                        r = dhcp4_request_route(route, link);
+                        if (r < 0)
+                                return r;
+
+                        continue;
+                }
+
                 r = dhcp4_request_route_auto(route, link, &gw);
                 if (r < 0)
                         return r;
@@ -800,6 +1096,42 @@ static int dhcp4_request_routes_to_ntp(Link *link) {
                 return r;
 
         return dhcp4_request_routes_to_servers(link, ntp, r);
+}
+
+int dhcp4_ipv6_resolved_gateway_update(Link *link) {
+        struct in_addr router;
+        int r;
+
+        assert(link);
+
+        /* Invoked by the NDisc machinery whenever the default router list has changed. Re-evaluates every
+         * route that depends on it, if the DHCPv4 lease designates the IPv6-resolved gateway. */
+
+        if (!link->dhcp_lease || !link->network)
+                return 0;
+
+        r = dhcp4_get_router(link, &router);
+        if (r == -ENODATA)
+                return 0;
+        if (r < 0)
+                return r;
+
+        if (!dhcp4_router_is_ipv6_resolved(link, &router))
+                return 0;
+
+        r = dhcp4_request_ipv6_resolved_gateway(link);
+        if (r < 0)
+                return r;
+
+        r = dhcp4_request_semi_static_routes(link);
+        if (r < 0)
+                return r;
+
+        r = dhcp4_request_routes_to_dns(link);
+        if (r < 0)
+                return r;
+
+        return dhcp4_request_routes_to_ntp(link);
 }
 
 static int dhcp4_request_routes(Link *link) {

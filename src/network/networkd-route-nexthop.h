@@ -27,6 +27,7 @@ void route_nexthops_hash_func(const Route *route, struct siphash *state);
 int route_nexthops_compare_func(const Route *a, const Route *b);
 
 int route_nexthops_copy(const Route *src, const RouteNextHop *nh, Route *dest);
+int route_nexthops_add_ipv6_via(Route *route, const struct in6_addr *gws, size_t n, int ifindex);
 bool route_nexthops_needs_adjust(const Route *route);
 int route_adjust_nexthops(Route *route, Link *link);
 

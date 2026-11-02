@@ -270,6 +270,8 @@ DHCPv4.UseHostname,                              config_parse_bool,             
 DHCPv4.UseDomains,                               config_parse_use_domains,                       0,                                      offsetof(Network, dhcp_use_domains)
 DHCPv4.UseRoutes,                                config_parse_bool,                              0,                                      offsetof(Network, dhcp_use_routes)
 DHCPv4.UseGateway,                               config_parse_tristate,                          0,                                      offsetof(Network, dhcp_use_gateway)
+DHCPv4.UseIPv6ResolvedGateway,                   config_parse_bool,                              0,                                      offsetof(Network, dhcp_use_ipv6_resolved_gateway)
+DHCPv4.IPv6ResolvedGatewayAddress,               config_parse_in_addr_non_null,                  AF_INET,                                offsetof(Network, dhcp_ipv6_resolved_gateway_address)
 DHCPv4.QuickAck,                                 config_parse_bool,                              0,                                      offsetof(Network, dhcp_quickack)
 DHCPv4.RequestOptions,                           config_parse_dhcp_request_options,              AF_INET,                                0
 DHCPv4.Anonymize,                                config_parse_bool,                              0,                                      offsetof(Network, dhcp_anonymize)
